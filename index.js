@@ -2,7 +2,7 @@ const express = require('express');
 const dotenv = require('dotenv');
 const cors = require('cors');
 const connectDB = require('./config/db');
-const { settlementJob, backfillSettlementDates } = require('./jobs/settlementJob'); // ✅ Import backfill
+const { settlementJob, manualSettlement } = require('./jobs/settlementJob'); // ✅ Import backfill
 
 dotenv.config();
 connectDB();
@@ -24,15 +24,14 @@ app.use(express.json({
 settlementJob.start();
 console.log('✅ Settlement cron job started - runs daily at 4:00 PM IST');
 
-// ✅ Backfill missing settlement dates on server startup
-backfillSettlementDates().then(result => {
-    if (result.success) {
-        console.log(`✅ Backfilled ${result.count} transactions with missing settlement dates`);
-    } else {
-        console.error(`❌ Backfill failed: ${result.error}`);
+// ✅ Backfill missin
+app.get('/api/superadmin/manual-settlement', async (req, res) => {
+    try {
+        await manualSettlement();
+        res.json({ success: true, message: 'Manual settlement completed' });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
     }
-}).catch(err => {
-    console.error('❌ Backfill error:', err);
 });
 
 // Routes
