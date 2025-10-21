@@ -4,94 +4,89 @@ const Transaction = require('../models/Transaction');
 const User = require('../models/User');
 const { calculatePayinCommission, calculatePayoutCommission } = require('../utils/commissionCalculator');
 const { getSettlementStatusMessage } = require('../utils/settlementCalculator');
-
+const mongoose = require('mongoose');
 // ============ GET MY BALANCE (Updated with T+1 settlement tracking) ============
+
+// Use commission percentage/gst rate as needed (here: 3.8% + 18% GST)
+
+const COMMISSION_RATE = 0.038; // 3.8%
 
 exports.getMyBalance = async (req, res) => {
     try {
-        console.log(`💰 Admin ${req.user.name} checking balance`);
+        const merchantObjectId = mongoose.Types.ObjectId(req.merchantId);
 
-        // Get all successful transactions
-        const successfulTransactions = await Transaction.find({
-            merchantId: req.merchantId,
-            status: 'paid'
-        });
+        // Aggregate settled transactions
+        const settledAgg = await Transaction.aggregate([
+            { $match: { merchantId: merchantObjectId, status: 'paid', settlementStatus: 'settled' } },
+            {
+                $group: {
+                    _id: null,
+                    settledRevenue: { $sum: '$amount' },
+                    settledRefunded: { $sum: { $ifNull: ['$refundAmount', 0] } },
+                    settledCount: { $sum: 1 }
+                }
+            }
+        ]);
+        const settled = settledAgg[0] || { settledRevenue: 0, settledRefunded: 0, settledCount: 0 };
+        const settledCommission = settled.settledRevenue * COMMISSION_RATE;
 
-        // ✅ SEPARATE SETTLED AND UNSETTLED
-        const settledTransactions = successfulTransactions.filter(t => t.settlementStatus === 'settled');
-        const unsettledTransactions = successfulTransactions.filter(t => t.settlementStatus === 'unsettled');
+        // Aggregate unsettled transactions
+        const unsettledAgg = await Transaction.aggregate([
+            { $match: { merchantId: merchantObjectId, status: 'paid', settlementStatus: 'unsettled' } },
+            {
+                $group: {
+                    _id: null,
+                    unsettledRevenue: { $sum: '$amount' },
+                    unsettledCount: { $sum: 1 }
+                }
+            }
+        ]);
+        const unsettled = unsettledAgg[0] || { unsettledRevenue: 0, unsettledCount: 0 };
+        const unsettledCommission = unsettled.unsettledRevenue * COMMISSION_RATE;
 
-        // Calculate settled revenue and commission
-        let settledRevenue = 0;
-        let settledCommission = 0;
+        // Get next settlement info
+        const nextUnsettledTransaction = await Transaction.findOne({
+            merchantId: merchantObjectId,
+            status: 'paid',
+            settlementStatus: 'unsettled'
+        }).sort({ expectedSettlementDate: 1 });
 
-        settledTransactions.forEach(transaction => {
-            settledRevenue += transaction.amount;
-            const commissionInfo = calculatePayinCommission(transaction.amount);
-            settledCommission += commissionInfo.commission;
-        });
+        // Aggregate payouts
+        const completedPayoutAgg = await Payout.aggregate([
+            { $match: { merchantId: merchantObjectId, status: 'completed' } },
+            { $group: { _id: null, totalPaidOut: { $sum: '$netAmount' }, count: { $sum: 1 } } }
+        ]);
+        const pendingPayoutAgg = await Payout.aggregate([
+            { $match: { merchantId: merchantObjectId, status: { $in: ['requested', 'pending', 'processing'] } } },
+            { $group: { _id: null, totalPending: { $sum: '$netAmount' }, count: { $sum: 1 } } }
+        ]);
+        const totalPaidOut = completedPayoutAgg[0]?.totalPaidOut || 0;
+        const totalPending = pendingPayoutAgg[0]?.totalPending || 0;
 
-        // Calculate unsettled revenue and commission
-        let unsettledRevenue = 0;
-        let unsettledCommission = 0;
-
-        unsettledTransactions.forEach(transaction => {
-            unsettledRevenue += transaction.amount;
-            const commissionInfo = calculatePayinCommission(transaction.amount);
-            unsettledCommission += commissionInfo.commission;
-        });
-
-        const totalRevenue = settledRevenue + unsettledRevenue;
-        const totalCommission = settledCommission + unsettledCommission;
-        const totalRefunded = successfulTransactions.reduce((sum, t) => sum + (t.refundAmount || 0), 0);
-
-        // Get payouts
-        const completedPayouts = await Payout.find({
-            merchantId: req.merchantId,
-            status: 'completed'
-        });
-        const pendingPayouts = await Payout.find({
-            merchantId: req.merchantId,
-            status: { $in: ['requested', 'pending', 'processing'] }
-        });
-
-        const totalPaidOut = completedPayouts.reduce((sum, p) => sum + p.netAmount, 0);
-        const totalPending = pendingPayouts.reduce((sum, p) => sum + p.netAmount, 0);
-
-        // ✅ CALCULATE SETTLED BALANCE (available for payout)
-        const settledNetRevenue = settledRevenue - totalRefunded - settledCommission;
+        // Calculations
+        const settledNetRevenue = settled.settledRevenue - settled.settledRefunded - settledCommission;
         const availableBalance = settledNetRevenue - totalPaidOut - totalPending;
 
-        // ✅ CALCULATE UNSETTLED BALANCE (locked until settlement)
-        const unsettledNetRevenue = unsettledRevenue - unsettledCommission;
+        const totalRevenue = settled.settledRevenue + unsettled.unsettledRevenue;
+        const totalCommission = settledCommission + unsettledCommission;
+        const totalRefunded = settled.settledRefunded; // rarely unsettled refunds
 
-        // ✅ Calculate maximum payout amount (considering commission)
+        // Max payout logic
         let maxPayoutGrossAmount = availableBalance;
         if (availableBalance > 0) {
             if (availableBalance > 1000) {
-                maxPayoutGrossAmount = availableBalance / 0.9823; // Accounting for 1.77% commission
+                // For payout above ₹1000 (1.77% fee): gross = available/netPct
+                maxPayoutGrossAmount = availableBalance / 0.9823;
             } else if (availableBalance > 500) {
                 maxPayoutGrossAmount = Math.min(availableBalance + 35.40, 1000);
-            } else {
-                maxPayoutGrossAmount = availableBalance;
             }
         }
 
-        // ✅ Get next settlement info
-        const nextUnsettledTransaction = unsettledTransactions
-            .sort((a, b) => new Date(a.expectedSettlementDate) - new Date(b.expectedSettlementDate))[0];
-
+        // Settlement status message
         const nextSettlementText = nextUnsettledTransaction
-            ? getSettlementStatusMessage(
-                nextUnsettledTransaction.paidAt,
-                nextUnsettledTransaction.expectedSettlementDate
-            )
+            ? getSettlementStatusMessage(nextUnsettledTransaction.paidAt, nextUnsettledTransaction.expectedSettlementDate)
             : 'No pending settlements';
-
-        const nextSettlementStatus = nextUnsettledTransaction
-            ? nextUnsettledTransaction.settlementStatus
-            : null;
-
+        const nextSettlementStatus = nextUnsettledTransaction?.settlementStatus || null;
 
         res.json({
             success: true,
@@ -99,51 +94,40 @@ exports.getMyBalance = async (req, res) => {
                 merchantId: req.merchantId,
                 merchantName: req.merchantName,
                 merchantEmail: req.user.email,
-                freePayoutsRemaining: req.user.freePayoutsUnder500 || 0  // ✅ ADD THIS
+                freePayoutsRemaining: req.user.freePayoutsUnder500 || 0
             },
-
             balance: {
-                // ✅ SETTLED BALANCE (can withdraw)
-                settled_revenue: settledRevenue.toFixed(2),
+                settled_revenue: settled.settledRevenue.toFixed(2),
                 settled_commission: settledCommission.toFixed(2),
                 settled_net_revenue: settledNetRevenue.toFixed(2),
                 available_balance: availableBalance.toFixed(2),
 
-                // ✅ UNSETTLED BALANCE (locked)
-                unsettled_revenue: unsettledRevenue.toFixed(2),
+                unsettled_revenue: unsettled.unsettledRevenue.toFixed(2),
                 unsettled_commission: unsettledCommission.toFixed(2),
-                unsettled_net_revenue: unsettledNetRevenue.toFixed(2),
+                unsettled_net_revenue: (unsettled.unsettledRevenue - unsettledCommission).toFixed(2),
 
-                // TOTALS
                 total_revenue: totalRevenue.toFixed(2),
                 total_refunded: totalRefunded.toFixed(2),
                 total_commission: totalCommission.toFixed(2),
                 commission_deducted: totalCommission.toFixed(2),
-                net_revenue: (settledNetRevenue + unsettledNetRevenue).toFixed(2),
+                net_revenue: (settledNetRevenue + unsettled.unsettledRevenue - unsettledCommission).toFixed(2),
                 total_paid_out: totalPaidOut.toFixed(2),
                 pending_payouts: totalPending.toFixed(2),
 
                 commission_structure: {
-                    payin: '3.8% ',
+                    payin: '3.8%',
                     payout_500_to_1000: '₹30 ',
                     payout_above_1000: '(1.77%)'
                 }
             },
             settlement_info: {
-                // Counts
-                settled_transactions: settledTransactions.length,
-                unsettled_transactions: unsettledTransactions.length,
-
-                // Next settlement
+                settled_transactions: settled.settledCount,
+                unsettled_transactions: unsettled.unsettledCount,
                 next_settlement: nextSettlementText,
                 next_settlement_date: nextUnsettledTransaction?.expectedSettlementDate?.toISOString() || null,
                 next_settlement_status: nextSettlementStatus,
-
-                // Settlement policy
                 settlement_policy: 'T+1 settlement (24 hours after payment)',
                 weekend_policy: 'Saturday and Sunday are off. Weekend payments settle on Monday.',
-
-                // Examples for clarity
                 settlement_examples: {
                     'Monday payment': 'Settles Tuesday (24 hours)',
                     'Tuesday payment': 'Settles Wednesday (24 hours)',
@@ -155,14 +139,15 @@ exports.getMyBalance = async (req, res) => {
                 }
             },
             transaction_summary: {
-                total_transactions: successfulTransactions.length,
-                settled_transactions: settledTransactions.length,
-                unsettled_transactions: unsettledTransactions.length,
-                total_payouts_completed: completedPayouts.length,
-                pending_payout_requests: pendingPayouts.length,
-                avg_commission_per_transaction: successfulTransactions.length > 0
-                    ? (totalCommission / successfulTransactions.length).toFixed(2)
-                    : '0.00'
+                total_transactions: settled.settledCount + unsettled.unsettledCount,
+                settled_transactions: settled.settledCount,
+                unsettled_transactions: unsettled.unsettledCount,
+                total_payouts_completed: completedPayoutAgg[0]?.count || 0,
+                pending_payout_requests: pendingPayoutAgg[0]?.count || 0,
+                avg_commission_per_transaction:
+                    (settled.settledCount + unsettled.unsettledCount) > 0
+                        ? (totalCommission / (settled.settledCount + unsettled.unsettledCount)).toFixed(2)
+                        : '0.00'
             },
             payout_eligibility: {
                 can_request_payout: availableBalance > 0,
@@ -179,18 +164,200 @@ exports.getMyBalance = async (req, res) => {
 
         console.log(`✅ Balance returned to ${req.user.name}:`);
         console.log(`   - Available: ₹${availableBalance.toFixed(2)}`);
-        console.log(`   - Settled: ${settledTransactions.length} transactions`);
-        console.log(`   - Unsettled: ${unsettledTransactions.length} transactions`);
+        console.log(`   - Settled: ${settled.settledCount} transactions`);
+        console.log(`   - Unsettled: ${unsettled.unsettledCount} transactions`);
         console.log(`   - Next settlement: ${nextSettlementText}`);
-
     } catch (error) {
         console.error('❌ Get My Balance Error:', error);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to fetch balance'
-        });
+        res.status(500).json({ success: false, error: 'Failed to fetch balance' });
     }
 };
+  
+exports.searchTransactions = async (req, res) => {
+  try {
+    const {
+      merchantId,
+      minAmount,
+      maxAmount,
+      startDate,
+      endDate,
+      description,
+      transactionId,
+      orderId,
+      customerName,
+      customerEmail,
+      customerPhone,
+      status,
+      paymentGateway,
+      paymentMethod,
+      page = 1,
+      limit = 20,
+      sortBy = 'createdAt',
+      sortOrder = 'desc',
+      search // global search string
+    } = req.query;
+
+    const query = {};
+
+    if (merchantId) query.merchantId = mongoose.Types.ObjectId(merchantId);
+    if (status) query.status = status;
+    if (paymentGateway) query.paymentGateway = paymentGateway;
+    if (paymentMethod) query.paymentMethod = paymentMethod;
+
+    // Amount filter
+    if (minAmount || maxAmount) {
+      query.amount = {};
+      if (minAmount) query.amount.$gte = parseFloat(minAmount);
+      if (maxAmount) query.amount.$lte = parseFloat(maxAmount);
+    }
+
+    // Date range
+    if (startDate || endDate) {
+      query.createdAt = {};
+      if (startDate) query.createdAt.$gte = new Date(startDate);
+      if (endDate) query.createdAt.$lte = new Date(endDate);
+    }
+
+    // Specific attribute search
+    if (description) query.description = { $regex: description, $options: 'i' };
+    if (transactionId) query.transactionId = transactionId;
+    if (orderId) query.orderId = orderId;
+    if (customerName) query.customerName = { $regex: customerName, $options: 'i' };
+    if (customerEmail) query.customerEmail = { $regex: customerEmail, $options: 'i' };
+    if (customerPhone) query.customerPhone = customerPhone; // or regex for partial match
+
+    // Global text search
+    if (search) {
+      query.$or = [
+        { transactionId: { $regex: search, $options: 'i' } },
+        { orderId: { $regex: search, $options: 'i' } },
+        { description: { $regex: search, $options: 'i' } },
+        { customerName: { $regex: search, $options: 'i' } },
+        { customerEmail: { $regex: search, $options: 'i' } },
+        { customerPhone: { $regex: search, $options: 'i' } }
+      ];
+    }
+
+    // Sorting and pagination
+    const sort = {};
+    sort[sortBy] = sortOrder === 'asc' ? 1 : -1;
+
+    const totalCount = await Transaction.countDocuments(query);
+
+    const transactions = await Transaction.find(query)
+      .sort(sort)
+      .skip((parseInt(page) - 1) * parseInt(limit))
+      .limit(parseInt(limit))
+      .lean();
+    
+    res.json({
+      success: true,
+      transactions,
+      pagination: {
+        currentPage: parseInt(page),
+        totalPages: Math.ceil(totalCount / parseInt(limit)),
+        totalCount,
+        limit: parseInt(limit),
+        hasNextPage: parseInt(page) < Math.ceil(totalCount / parseInt(limit)),
+        hasPrevPage: parseInt(page) > 1
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Search Transactions Error:', error);
+    res.status(500).json({ success: false, error: 'Failed to search transactions' });
+  }
+};
+
+
+exports.searchPayouts = async (req, res) => {
+  try {
+    const {
+      merchantId,
+      payoutId,
+      minAmount,
+      maxAmount,
+      status,
+      startDate,
+      endDate,
+      description,
+      beneficiaryName,
+      notes,
+      sortBy = 'createdAt',
+      sortOrder = 'desc',
+      page = 1,
+      limit = 20,
+      search // global search string
+    } = req.query;
+
+    const query = {};
+
+    if (merchantId) query.merchantId = mongoose.Types.ObjectId(merchantId);
+    if (payoutId) query.payoutId = payoutId;
+    if (status) query.status = status;
+
+    // Amount filter
+    if (minAmount || maxAmount) {
+      query.amount = {};
+      if (minAmount) query.amount.$gte = parseFloat(minAmount);
+      if (maxAmount) query.amount.$lte = parseFloat(maxAmount);
+    }
+
+    // Date range
+    if (startDate || endDate) {
+      query.createdAt = {};
+      if (startDate) query.createdAt.$gte = new Date(startDate);
+      if (endDate) query.createdAt.$lte = new Date(endDate);
+    }
+
+    // Specific attribute search
+    if (description) query.description = { $regex: description, $options: 'i' };
+    if (notes) query.adminNotes = { $regex: notes, $options: 'i' };
+    if (beneficiaryName) query['beneficiaryDetails.accountHolderName'] = { $regex: beneficiaryName, $options: 'i' };
+
+    // Global text search
+    if (search) {
+      query.$or = [
+        { payoutId: { $regex: search, $options: 'i' } },
+        { merchantName: { $regex: search, $options: 'i' } },
+        { description: { $regex: search, $options: 'i' } },
+        { adminNotes: { $regex: search, $options: 'i' } },
+        { 'beneficiaryDetails.accountHolderName': { $regex: search, $options: 'i' } }
+      ];
+    }
+
+    // Sorting and pagination
+    const sort = {};
+    sort[sortBy] = sortOrder === 'asc' ? 1 : -1;
+
+    const totalCount = await Payout.countDocuments(query);
+
+    const payouts = await Payout.find(query)
+      .sort(sort)
+      .skip((parseInt(page) - 1) * parseInt(limit))
+      .limit(parseInt(limit))
+      .lean();
+
+    res.json({
+      success: true,
+      payouts,
+      pagination: {
+        currentPage: parseInt(page),
+        totalPages: Math.ceil(totalCount / parseInt(limit)),
+        totalCount,
+        limit: parseInt(limit),
+        hasNextPage: parseInt(page) < Math.ceil(totalCount / parseInt(limit)),
+        hasPrevPage: parseInt(page) > 1
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Search Payouts Error:', error);
+    res.status(500).json({ success: false, error: 'Failed to search payouts' });
+  }
+};
+
+
 exports.getTransactionById = async (req, res) => {
     try {
         const { transactionId } = req.params;

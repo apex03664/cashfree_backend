@@ -23,10 +23,7 @@ const TransactionSchema = new mongoose.Schema({
     razorpayOrderId: String,
     razorpayReferenceId: String,
     
-    // Cashfree Fields
-    cashfreeOrderToken: String,
-    cashfreePaymentId: String,
-    cashfreeOrderId: String,
+ 
     
     // Payment Gateway
     paymentGateway: String, // 'razorpay' or 'cashfree'
