@@ -220,16 +220,14 @@ exports.getTransactionById = async (req, res) => {
         });
     }
 };
-// ============ REQUEST PAYOUT (Updated - No Min/Max Limits) ============
-// ============ REQUEST PAYOUT (All Settled Transactions) ============
-// ============ REQUEST PAYOUT (Custom Amount or All Settled) ============
 exports.requestPayout = async (req, res) => {
     try {
         const {
-            amount, // ✅ NEW: Optional custom amount
+            amount,
             transferMode,
             beneficiaryDetails,
-            notes
+            notes,
+            description
         } = req.body;
 
         console.log(`💰 Admin ${req.user.name} requesting payout`);
@@ -242,73 +240,66 @@ exports.requestPayout = async (req, res) => {
             });
         }
 
-        // ✅ Get ALL settled transactions that haven't been paid out yet
-        const transactionsForPayout = await Transaction.find({
+        // ✅ Calculate total settled balance (all paid transactions that haven't been paid out)
+        const settledTransactions = await Transaction.find({
             merchantId: req.merchantId,
-            settlementStatus: 'settled',
-            payoutStatus: 'unpaid'
-        }).sort({ settlementDate: 1 }); // Sort by oldest first
+            status: 'paid',
+            settlementStatus: 'settled'
+        });
 
-        if (transactionsForPayout.length === 0) {
+        if (settledTransactions.length === 0) {
             return res.status(400).json({
                 success: false,
-                error: 'No settled transactions available for payout'
+                error: 'No settled balance available for payout'
             });
         }
 
-        const totalAvailableAmount = transactionsForPayout.reduce((sum, t) => sum + t.amount, 0);
+        // ✅ Calculate total available balance
+        const totalSettledAmount = settledTransactions.reduce((sum, t) => sum + t.amount, 0);
+
+        // ✅ Get total already paid out
+        const completedPayouts = await Payout.find({
+            merchantId: req.merchantId,
+            status: { $in: ['requested', 'processing', 'completed'] }
+        });
+
+        const totalPaidOut = completedPayouts.reduce((sum, p) => sum + p.amount, 0);
+
+        // ✅ Calculate available balance
+        const availableBalance = totalSettledAmount - totalPaidOut;
+
+        if (availableBalance <= 0) {
+            return res.status(400).json({
+                success: false,
+                error: 'No balance available for payout',
+                availableBalance: 0
+            });
+        }
 
         // ✅ Determine final payout amount
-        let finalAmount = amount || totalAvailableAmount;
+        let finalAmount = amount || availableBalance;
 
         // ✅ Validate requested amount
-        if (amount) {
-            if (amount <= 0) {
-                return res.status(400).json({
-                    success: false,
-                    error: 'Requested amount must be greater than 0'
-                });
-            }
-
-            if (amount > totalAvailableAmount) {
-                return res.status(400).json({
-                    success: false,
-                    error: `Requested amount ₹${amount} exceeds available balance ₹${totalAvailableAmount}`,
-                    availableBalance: totalAvailableAmount
-                });
-            }
-
-            console.log(`📊 Partial payout requested: ₹${amount} out of ₹${totalAvailableAmount} available`);
-        } else {
-            console.log(`📊 Full payout requested: ₹${totalAvailableAmount} from ${transactionsForPayout.length} transactions`);
-        }
-
-        // ✅ Select transactions up to the requested amount
-        let selectedTransactions = [];
-        let runningTotal = 0;
-
-        for (const txn of transactionsForPayout) {
-            if (runningTotal + txn.amount <= finalAmount) {
-                selectedTransactions.push(txn);
-                runningTotal += txn.amount;
-            } else {
-                break; // Stop when we've collected enough
-            }
-        }
-
-        if (selectedTransactions.length === 0) {
+        if (finalAmount <= 0) {
             return res.status(400).json({
                 success: false,
-                error: 'No transactions can fit within the requested amount',
-                minimumAmount: transactionsForPayout[0]?.amount
+                error: 'Requested amount must be greater than 0'
             });
         }
 
-        const actualPayoutAmount = selectedTransactions.reduce((sum, t) => sum + t.amount, 0);
+        if (finalAmount > availableBalance) {
+            return res.status(400).json({
+                success: false,
+                error: `Requested amount ₹${finalAmount} exceeds available balance ₹${availableBalance}`,
+                availableBalance: availableBalance
+            });
+        }
+
+        console.log(`📊 Payout requested: ₹${finalAmount} out of ₹${availableBalance} available`);
 
         // --- Balance and Commission Calculation ---
         const merchant = await User.findById(req.merchantId);
-        const payoutCommissionInfo = calculatePayoutCommission(actualPayoutAmount, merchant);
+        const payoutCommissionInfo = calculatePayoutCommission(finalAmount, merchant);
         const payoutCommission = payoutCommissionInfo.commission;
         const netAmount = payoutCommissionInfo.netAmount;
 
@@ -319,11 +310,12 @@ exports.requestPayout = async (req, res) => {
             payoutId,
             merchantId: req.merchantId,
             merchantName: req.merchantName,
-            amount: actualPayoutAmount,
+            amount: finalAmount,
             commission: payoutCommission,
             commissionType: payoutCommissionInfo.commissionType,
             commissionBreakdown: payoutCommissionInfo.breakdown,
             netAmount,
+            description: description || '',
             currency: 'INR',
             transferMode,
             beneficiaryDetails,
@@ -336,47 +328,29 @@ exports.requestPayout = async (req, res) => {
 
         await payout.save();
 
-        // --- Update Transactions and Decrement Free Payouts ---
+        // --- Decrement Free Payouts if applicable ---
         if (payoutCommissionInfo.commissionType === 'free') {
             merchant.freePayoutsUnder500 -= 1;
             await merchant.save();
         }
 
-        const transactionIds = selectedTransactions.map(t => t._id);
-        await Transaction.updateMany(
-            { _id: { $in: transactionIds } },
-            { 
-                $set: { 
-                    payoutStatus: 'requested',
-                    payoutId: payout._id
-                }
-            }
-        );
-
-        console.log(`✅ Payout request created: ${payoutId} for ${selectedTransactions.length} transactions totaling ₹${actualPayoutAmount}`);
+        console.log(`✅ Payout request created: ${payoutId} for ₹${finalAmount}`);
 
         res.json({
             success: true,
             payout: {
                 payoutId,
                 amount: amount || 'full',
-                actualAmount: actualPayoutAmount,
+                actualAmount: finalAmount,
                 commission: payoutCommission,
                 netAmount,
                 status: 'requested',
                 requestedAt: payout.requestedAt,
-                transaction_count: selectedTransactions.length,
-                remaining_balance: totalAvailableAmount - actualPayoutAmount,
-                transactions: selectedTransactions.map(t => ({
-                    transactionId: t.transactionId,
-                    amount: t.amount,
-                    settlementDate: t.settlementDate,
-                    paidAt: t.paidAt
-                }))
+                remaining_balance: availableBalance - finalAmount
             },
-            message: amount 
-                ? `Partial payout request of ₹${actualPayoutAmount} submitted successfully (${selectedTransactions.length} transactions)`
-                : `Payout request submitted successfully for all ${selectedTransactions.length} settled transactions`
+            message: amount
+                ? `Payout request of ₹${finalAmount} submitted successfully`
+                : `Full payout request of ₹${finalAmount} submitted successfully`
         });
 
     } catch (error) {
@@ -396,8 +370,8 @@ exports.getMyPayouts = async (req, res) => {
             page = 1,
             limit = 20,
             status,
-            
-             
+
+
             sortBy = 'createdAt',
             sortOrder = 'desc'
         } = req.query;
@@ -414,7 +388,7 @@ exports.getMyPayouts = async (req, res) => {
             }
         }
 
-       
+
 
         const totalCount = await Payout.countDocuments(query);
 
